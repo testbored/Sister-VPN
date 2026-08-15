@@ -1,38 +1,85 @@
 #include "vpn.hpp"
 
+#include <arpa/inet.h>
+#include <poll.h>
 
-void VPN::openTUN(const char* dev_name){
-    int fd = open("/dev/net/tun", O_RDWR);
-    if (fd < 0) { perror("open tun"); exit(1); }
+#include <array>
+#include <cerrno>
+#include <cstring>
+#include <iostream>
+#include <stdexcept>
+#include <vector>
 
-    ifreq ifr;
-    memset(&ifr, 0, sizeof(ifr));
-
-    ifr.ifr_flags = IFF_TUN | IFF_NO_PI;
-    strncpy(ifr.ifr_name, dev_name, IFNAMSIZ);
-
-    if (ioctl(fd, TUNSETIFF, &ifr) < 0) {
-        perror("ioctl TUNSETIFF"); exit(1);
+VPN::VPN(const VPNConfig& config)
+    : config_(config),
+      socket_(config.localPort, config.peerAddress, config.peerPort),
+      tunnel_(config.tunName),
+      transmitKey_(crypto::deriveDirectionalKey(
+          config.preSharedKey, config.role == Role::Initiator
+              ? "sister-vpn/v1/init-to-resp" : "sister-vpn/v1/resp-to-init")),
+      receiveKey_(crypto::deriveDirectionalKey(
+          config.preSharedKey, config.role == Role::Initiator
+              ? "sister-vpn/v1/resp-to-init" : "sister-vpn/v1/init-to-resp")),
+      sessionId_(crypto::randomSessionId()) {
+    if (config.mtu < 576 || config.mtu > 65507) {
+        throw std::invalid_argument("MTU must be 576..65507");
     }
-
-    this->fd = fd;
 }
 
-void VPN::setUpUDP(int localPort){
-    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+const std::string& VPN::tunName() const { return tunnel_.name(); }
 
-    struct sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_port = htons(localPort);
-
-    bind(fd, (struct sockaddr*)&addr, sizeof(addr));
-    this->sockFd = fd;
+void VPN::run() {
+    std::cerr << "VPN running: TUN " << tunnel_.name() << ", UDP " << config_.localPort
+              << " -> " << config_.peerAddress << ':' << config_.peerPort << '\n';
+    std::array<pollfd, 2> descriptors{{
+        {tunnel_.getFd(), POLLIN, 0},
+        {socket_.getFd(), POLLIN, 0},
+    }};
+    while (true) {
+        const int result = poll(descriptors.data(), descriptors.size(), -1);
+        if (result < 0) {
+            if (errno == EINTR) continue;
+            throw std::runtime_error("poll failed");
+        }
+        if (descriptors[0].revents & POLLIN) forwardTunToUdp();
+        if (descriptors[1].revents & POLLIN) forwardUdpToTun();
+        if ((descriptors[0].revents | descriptors[1].revents) & (POLLERR | POLLHUP | POLLNVAL)) {
+            throw std::runtime_error("descriptor error");
+        }
+    }
 }
 
+void VPN::forwardTunToUdp() {
+    std::vector<std::uint8_t> packet(config_.mtu);
+    const auto plainLength = tunnel_.readPacket(
+        packet.data() + sizeof(PacketHeader), config_.mtu - sizeof(PacketHeader) - crypto::TAG_BYTES);
+    PacketHeader header{htonl(VPN_PACKET_MAGIC), VPN_PACKET_VERSION, 0, 0,
+                        htonl(sessionId_), hostToBigEndian64(nextSequence_++)};
+    std::memcpy(packet.data(), &header, sizeof(header));
+    const auto encryptedLength = crypto::encrypt(
+        transmitKey_, nonceFromHeader(header), packet.data(), sizeof(header),
+        packet.data() + sizeof(header), plainLength, packet.data() + sizeof(header),
+        packet.size() - sizeof(header));
+    socket_.send(packet.data(), sizeof(header) + encryptedLength);
+}
 
+void VPN::forwardUdpToTun() {
+    std::vector<std::uint8_t> packet(config_.mtu);
+    const auto received = socket_.receive(packet.data(), packet.size());
+    if (received < sizeof(PacketHeader) + crypto::TAG_BYTES) return;
 
-
-VPN::VPN(const std::string& ipAddress, const std::string& subnetMask){
-    
+    PacketHeader header{};
+    std::memcpy(&header, packet.data(), sizeof(header));
+    try {
+        validateHeader(header);
+        const auto plainLength = crypto::decrypt(
+            receiveKey_, nonceFromHeader(header), packet.data(), sizeof(header),
+            packet.data() + sizeof(header), received - sizeof(header),
+            packet.data() + sizeof(header), packet.size() - sizeof(header));
+        if (replayWindow_.accept(ntohl(header.sessionId), bigEndianToHost64(header.sequence))) {
+            tunnel_.writePacket(packet.data() + sizeof(header), plainLength);
+        }
+    } catch (const std::exception& error) {
+        std::cerr << "Dropped UDP packet: " << error.what() << '\n';
+    }
 }

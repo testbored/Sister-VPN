@@ -1,25 +1,39 @@
 #pragma once
 
-#include <linux/if.h>
-#include <linux/if_tun.h>
-#include <sys/ioctl.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <fcntl.h>
-#include <cstring>
+#include "crypto.hpp"
+#include "session.hpp"
+#include "tun.hpp"
+#include "udp.hpp"
+
+#include <cstdint>
 #include <string>
 
-class VPN{
-private:
-    int fd;
-    int sockFd;
-    
-    void openTUN(const char* dev_name);
-    void setUpUDP(int localPort);
+enum class Role { Initiator, Responder };
 
+struct VPNConfig {
+    std::string tunName;
+    std::uint16_t localPort;
+    std::string peerAddress;
+    std::uint16_t peerPort;
+    crypto::Key preSharedKey;
+    Role role;
+    std::uint32_t mtu{1400};
+};
+
+class VPN {
 public:
-    VPN(const std::string& ipAddress, const std::string& subnetMask);
-    void send();
-    void receive();
+    explicit VPN(const VPNConfig& config);
+    void run();
+    const std::string& tunName() const;
+private:
+    void forwardTunToUdp();
+    void forwardUdpToTun();
+    VPNConfig config_;
+    UDP socket_;
+    TUN tunnel_;
+    crypto::Key transmitKey_;
+    crypto::Key receiveKey_;
+    std::uint32_t sessionId_;
+    std::uint64_t nextSequence_{0};
+    ReplayWindow replayWindow_;
 };
